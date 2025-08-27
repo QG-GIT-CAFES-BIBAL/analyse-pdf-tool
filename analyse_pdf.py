@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Analyse des PDFs (Touch N Pay) -> CSV
-- Extraction via pdftotext (Poppler), fallback OCR via Tesseract (CLI)
-- Support FR/EN (bilingue) pour CA et Ventes
-- Barre de progression colorée (Rich)
-- Résumé final "pro": tableau coloré + panel du fichier export
-- Historique conservé dans export_analyse_pdf.csv (append au lieu d'écraser)
-- Parsing robuste aux variations de layout (ordre 'prefix label' ou 'label prefix')
+Analyse des PDFs (Touch N Pay) -> CSV (v3 - robuste multi-layout)
+- Extraction texte multi-stratégies : Poppler (pdftotext) layout/raw, PyPDF2 (fallback), OCR Tesseract en dernier recours
+- Parsing adaptatif par lignes (FR/EN) :
+    • Détection des libellés (Total/Espèces/Cash/Cashless 1/2 + variantes Aztek)
+    • Colonnes "Cumul/Cumulation" + "Interim" + "Interim 2" même si réparties sur plusieurs lignes
+- Anti-bruit : normalisation chiffres (espace, point, virgule, €), séparation fiable des tokens
+- Score de complétude : succès si ≥ 6 champs numériques CA/Ventes trouvés (configurable)
+- Debug : exports .dbg.txt (texte brut) et .dbg.rows.jsonl (lignes tokenisées) par PDF en cas d’échec (pour affiner vite)
 """
 
-import os, re, csv, subprocess, tempfile, sys, time
+import os, re, csv, subprocess, tempfile, sys, time, json
 from pathlib import Path
 from datetime import datetime
+
+# UI
 from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
 from rich.theme import Theme
@@ -19,7 +22,6 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.box import HEAVY
 
-# ---------- UI ----------
 console = Console(theme=Theme({
     "ok": "bold green","err": "bold red","info": "bold cyan","warn": "bold yellow",
     "hl": "bold white","dim": "dim",
@@ -37,14 +39,17 @@ RESSOURCES_DIR = BASE_DIR / "dist_bundle_ressources"
 ROOT.mkdir(parents=True, exist_ok=True)
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Binaries
+# Binaries (facultatifs suivant OS)
 POPPLER_BIN = RESSOURCES_DIR / "poppler-bin"
-PDFTOTEXT = str(POPPLER_BIN / "pdftotext.exe")
-PDFTOPPM  = str(POPPLER_BIN / "pdftoppm.exe")
-TESSERACT_EXE = str(RESSOURCES_DIR / "tesseract" / "tesseract.exe")
+PDFTOTEXT = str(POPPLER_BIN / "pdftotext.exe") if os.name == "nt" else "pdftotext"
+PDFTOPPM  = str(POPPLER_BIN / "pdftoppm.exe")  if os.name == "nt" else "pdftoppm"
+TESSERACT_EXE = str(RESSOURCES_DIR / "tesseract" / "tesseract.exe") if os.name == "nt" else "tesseract"
 TESSDATA_DIR  = str(RESSOURCES_DIR / "tesseract" / "tessdata")
 TESS_LANG = "fra+eng"
-ENABLE_OCR_FALLBACK = True
+ENABLE_OCR_FALLBACK = True  # mettre False si tu veux éviter l’OCR
+
+# Seuil de réussite : au moins N champs CA/Ventes numériques trouvés
+MIN_NUMERIC_FIELDS = 6
 
 # ========= HELPERS =========
 def norm_spaces_keep_lines(s: str) -> str:
@@ -58,114 +63,120 @@ def get_first(regex, text, flags=0):
     m = re.search(regex, text, flags)
     return m.group(1).strip() if m else ""
 
-def run_pdftotext(pdf_path: str) -> str:
-    if not os.path.isfile(PDFTOTEXT):
-        return ""
+def _available(cmd: str) -> bool:
+    from shutil import which
+    return bool(which(cmd)) if os.name != "nt" else os.path.isfile(cmd)
+
+def run_pdftotext(pdf_path: str, mode: str = "layout") -> str:
+    if not _available(PDFTOTEXT): return ""
     try:
         with tempfile.TemporaryDirectory() as td:
             out_txt = Path(td) / "out.txt"
-            cmd = [PDFTOTEXT, "-layout", "-nopgbrk", pdf_path, str(out_txt)]
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=0x08000000)
+            args = ["-layout"] if mode == "layout" else []
+            cmd = [PDFTOTEXT, *args, "-nopgbrk", pdf_path, str(out_txt)]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           creationflags=0x08000000 if os.name=="nt" else 0)
             return out_txt.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return ""
 
+def run_pypdf2(pdf_path: str) -> str:
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(pdf_path)
+        pages = []
+        for p in reader.pages:
+            try:
+                pages.append(p.extract_text() or "")
+            except Exception:
+                pages.append("")
+        return "\n".join(pages)
+    except Exception:
+        return ""
+
 def run_tesseract_cli_on_pdf(pdf_path: str) -> str:
-    if not ENABLE_OCR_FALLBACK:
-        return ""
-    if not os.path.isfile(PDFTOPPM) or not os.path.isfile(TESSERACT_EXE):
-        return ""
+    if not ENABLE_OCR_FALLBACK: return ""
+    if not _available(PDFTOPPM) or not _available(TESSERACT_EXE): return ""
     full_text = ""
     try:
         with tempfile.TemporaryDirectory() as td:
             out_prefix = Path(td) / "page"
             subprocess.run([PDFTOPPM, "-png", "-r", "450", pdf_path, str(out_prefix)],
-                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=0x08000000)
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           creationflags=0x08000000 if os.name=="nt" else 0)
             imgs = sorted(Path(td).glob("page*.png"))
-            with Progress(
-                TextColumn("  [info]OCR[/info] {task.completed}/{task.total} page(s)"),
-                BarColumn(bar_width=None, complete_style="green", finished_style="bold green", pulse_style="yellow"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True
-            ) as p_ocr:
+            with Progress(TextColumn("  [info]OCR[/info] {task.completed}/{task.total} page(s)"),
+                          BarColumn(bar_width=None, complete_style="green", finished_style="bold green", pulse_style="yellow"),
+                          TimeElapsedColumn(), console=console, transient=True) as p_ocr:
                 task = p_ocr.add_task("OCR pages", total=len(imgs))
                 for i, img in enumerate(imgs, 1):
                     txt_out = Path(td) / f"ocr_{i}"
                     cmd_tess = [TESSERACT_EXE, str(img), str(txt_out),
-                                "-l", TESS_LANG, "--psm", "6", "--oem", "1",
-                                "--tessdata-dir", TESSDATA_DIR]
-                    subprocess.run(cmd_tess, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=0x08000000)
+                                "-l", TESS_LANG, "--psm", "6", "--oem", "1"]
+                    if TESSDATA_DIR and os.path.isdir(TESSDATA_DIR):
+                        cmd_tess += ["--tessdata-dir", TESSDATA_DIR]
+                    subprocess.run(cmd_tess, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   creationflags=0x08000000 if os.name=="nt" else 0)
                     part = (txt_out.with_suffix(".txt")).read_text(encoding="utf-8", errors="ignore")
-                    full_text += part + "\n"
-                    p_ocr.advance(task)
+                    full_text += part + "\n"; p_ocr.advance(task)
         return full_text
     except Exception:
         return ""
 
+# ========= EXTRACTION TEXTE MULTI-STRAT =========
+def extract_text_any(pdf_path: str) -> str:
+    # 1) pdftotext -layout
+    txt = run_pdftotext(pdf_path, "layout")
+    if strip_ok(txt): return txt
+    # 2) pdftotext "raw"
+    txt = run_pdftotext(pdf_path, "raw")
+    if strip_ok(txt): return txt
+    # 3) PyPDF2
+    txt = run_pypdf2(pdf_path)
+    if strip_ok(txt): return txt
+    # 4) OCR
+    txt = run_tesseract_cli_on_pdf(pdf_path)
+    return txt
+
+def strip_ok(s: str) -> bool:
+    return bool(s and s.strip())
+
 # ========= PARSING =========
-def parse_header(text: str) -> dict:
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    joined = "\n".join(lines)
-    id_val = ""
-    for ln in lines[:150]:
-        if "TOUCH" in ln.upper():
-            id_val = squash(ln)
-            id_val = re.sub(r"\s*\d{2}/\d{2}/\d{4}.*$", "", id_val).strip()
-            break
 
-    date_val = get_first(r"\b(\d{2}/\d{2}/\d{4})\b", joined)
-    num_rel  = get_first(r"(?:Num[ée]ro\s+de\s+relev[ée]|Report\s+number)\s*:\s*([0-9]+)", joined, flags=re.IGNORECASE)
-    return {"id": id_val, "date": date_val, "Numéro de relevé": num_rel}
+NUM_TOKEN = r"-?\d+(?:[.,]\d+)?(?:\s*€)?"
+TOKEN_RE = re.compile(NUM_TOKEN)
 
-def extract_codes_and_key(text: str) -> dict:
-    flat = re.sub(r"\s+", " ", text)
-    out = {}
-    for idx, val in re.findall(r"(?:Code\s+gratuit|Free\s+code)\s+(\d+)\s*:\s*([0-9]+(?:\*\*[0-9]/[0-9])?)", flat, flags=re.IGNORECASE):
-        out[f"Code gratuit {idx}"] = val
-    k1 = get_first(r"\bkey\s*1\s*:\s*([A-Za-z0-9]+)", flat, flags=re.IGNORECASE)
-    if k1:
-        out["key 1"] = k1
-    return out
+def clean_num_tok(tok: str) -> str:
+    if not tok: return ""
+    tok = tok.replace("€","").strip()
+    # sépare les espaces internes (ex: "145 142" -> "145","142") géré au niveau tokenisation par findall
+    return tok.replace(",", ".")
 
-# --- Numérisation robuste des valeurs ---
-_NUM = r"(-?\d+(?:[.,]\d+)?€?)"
-def _clean_num(s: str) -> str:
-    s = (s or "").replace("€", "").strip()
-    return s.replace(",", ".")
+# Synonymes / variantes
+LABELS_CA = {
+    # label canonique -> liste de variantes attendues
+    "CA total": ["CA Total","Total CA","Total","Total turnover"],
+    "CA Espece": ["CA Espèces","CA Espece","Espèces","Cash","Cash turnover"],
+    "CA Cashless1": ["Cashless 1","Cashless turnover 1"],
+    "CA Cashless1 Aztek": ["Cashless 1 Aztek","Aztek cashless turnover 1","Aztek 1"],
+    "CA Cashless2": ["Cashless 2","Cashless turnover 2"],
+    "CA Cashless2 Aztek": ["Cashless 2 Aztek","Aztek cashless turnover 2","Aztek 2"],
+}
+LABELS_VENTES = {
+    "Vente Total": ["Ventes Total","Vente Total","Total vends","Total sales"],
+    "Vente Espece": ["Ventes Espèces","Vente Espèces","Cash vends","Cash sales","Vends Cash"],
+    "Vente Cashless1": ["Ventes Cashless 1","Vente Cashless 1","Cashless vends 1","Cashless sales 1"],
+    "Vente Cashless1 Aztek": ["Ventes Cashless 1 Aztek","Vente Cashless 1 Aztek","Aztek cashless vends 1","Aztek sales 1"],
+    "Vente Cashless2": ["Ventes Cashless 2","Vente Cashless 2","Cashless vends 2","Cashless sales 2"],
+    "Vente Cashless2 Aztek": ["Ventes Cashless 2 Aztek","Vente Cashless 2 Aztek","Aztek cashless vends 2","Aztek sales 2"],
+}
 
-def grab_triple_multiline(text: str, prefix: str, label: str):
-    """
-    Cherche 'prefix label' OU 'label prefix' (avec : ou - optionnels),
-    puis attrape jusqu'à 3 valeurs numériques (Cumul / Interim / Interim2)
-    dans une fenêtre élargie pour tolérer les sauts de ligne.
-    """
-    if label is None:
-        return "", "", ""
-    if prefix:
-        patt_a = rf"{re.escape(prefix)}\s*[:\-]?\s*{re.escape(label)}"
-        patt_b = rf"{re.escape(label)}\s*[:\-]?\s*{re.escape(prefix)}"
-        m = re.search(patt_a, text, flags=re.IGNORECASE) or re.search(patt_b, text, flags=re.IGNORECASE)
-    else:
-        m = re.search(rf"{re.escape(label)}", text, flags=re.IGNORECASE)
-
-    if not m:
-        return "", "", ""
-
-    window = text[m.end(): m.end() + 400]
-    nums = re.findall(_NUM, window)
-    vals = [_clean_num(x) for x in nums]
-    a, b, c = (vals + ["", "", ""])[:3]
-    return a, b, c
-
-def parse_blocks(text: str, prefix: str, label_map: dict) -> dict:
-    out = {}
-    for label_src, col_base in label_map.items():
-        x, y, z = grab_triple_multiline(text, prefix, label_src)
-        out[f"{col_base}_Cumul"] = x
-        out[f"{col_base}_Interim"] = y
-        out[f"{col_base}_Interim2"] = z
-    return out
+COL_HEADERS = [
+    # variantes colonnes (FR/EN) ; ordre attendu: Cumul/Cumulation, Interim, Interim 2
+    ["Cumul","Cumulation","Cumulated","Cumulative"],
+    ["Interim","Interim."],   # on laisse simple
+    ["Interim 2","Interim2","Interim2.","Interim. 2","Interim.2"]
+]
 
 HEADERS = [
     "id","date","Numéro de relevé",
@@ -184,73 +195,149 @@ HEADERS = [
     "Code gratuit 1","Code gratuit 2","Code gratuit 3","Code gratuit 4","Code gratuit 5","Code gratuit 6","Code gratuit 7","key 1"
 ]
 
-# ========= PIPELINE =========
+def parse_header(text: str) -> dict:
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    joined = "\n".join(lines)
+    id_val = ""
+    for ln in lines[:150]:
+        if "TOUCH" in ln.upper():
+            id_val = squash(ln)
+            id_val = re.sub(r"\s*\d{2}/\d{2}/\d{4}.*$", "", id_val).strip()
+            break
+    date_val = get_first(r"\b(\d{2}/\d{2}/\d{4})\b", joined)
+    num_rel  = get_first(r"(?:Num[ée]ro\s+de\s+relev[ée]|Report\s+number)\s*:\s*([0-9]+)", joined, flags=re.IGNORECASE)
+    return {"id": id_val, "date": date_val, "Numéro de relevé": num_rel}
+
+def extract_codes_and_key(text: str) -> dict:
+    flat = re.sub(r"\s+", " ", text)
+    out = {}
+    for idx, val in re.findall(r"(?:Code\s+gratuit|Free\s+code)\s+(\d+)\s*:\s*([0-9]+(?:\*\*[0-9]/[0-9])?)", flat, flags=re.IGNORECASE):
+        out[f"Code gratuit {idx}"] = val
+    k1 = get_first(r"\bkey\s*1\s*:\s*([A-Za-z0-9]+)", flat, flags=re.IGNORECASE)
+    if k1: out["key 1"] = k1
+    return out
+
+def match_any(token: str, variants: list[str]) -> bool:
+    t = token.lower()
+    for v in variants:
+        if t == v.lower(): return True
+        # tolère sans accents / casse partielle
+        if v.lower() in t: return True
+    return False
+
+def find_col_header_positions(lines_norm: list[str]) -> tuple[int|None, list[int]]:
+    """
+    Cherche la ligne d'entête contenant Cumul/Cumulation + Interim (+/- Interim 2).
+    Retourne (index_ligne, [positions numériques trouvées ensuite] -> ici on ne se sert que de l'index_ligne)
+    """
+    for i, ln in enumerate(lines_norm[:200]):  # header plutôt haut
+        low = ln.lower()
+        ok_cumul = any(x.lower() in low for x in COL_HEADERS[0])
+        ok_inter = any(x.lower() in low for x in COL_HEADERS[1])
+        if ok_cumul and ok_inter:
+            return i, []
+    return None, []
+
+def parse_numbers_from_near(lines_norm: list[str], start_idx: int, max_span: int = 6) -> list[str]:
+    """
+    Récupère jusqu'à 3 nombres à partir de start_idx sur quelques lignes suivantes.
+    Prend les 3 premiers tokens numériques distincts rencontrés.
+    """
+    nums = []
+    for j in range(start_idx, min(start_idx + max_span, len(lines_norm))):
+        for tok in TOKEN_RE.findall(lines_norm[j]):
+            val = clean_num_tok(tok)
+            if val:
+                nums.append(val)
+                if len(nums) >= 3:
+                    return nums[:3]
+    return nums[:3]
+
+def build_reverse_index(label_map: dict) -> dict:
+    """
+    Construit un dict variante_normalisée -> label canonique
+    """
+    idx = {}
+    for canon, vars in label_map.items():
+        for v in vars:
+            idx[v.lower()] = canon
+    return idx
+
+IDX_CA = build_reverse_index(LABELS_CA)
+IDX_V = build_reverse_index(LABELS_VENTES)
+
+def canonical_from_line(ln: str, is_ca: bool) -> str|None:
+    low = ln.lower()
+    idx = IDX_CA if is_ca else IDX_V
+    # essaie exact contient
+    for var, canon in idx.items():
+        if var in low:
+            return canon
+    # essais bonus pour “Cashless 1/2 Aztek”
+    if "cashless" in low and "1" in low and "aztek" in low:
+        return ("CA Cashless1 Aztek" if is_ca else "Vente Cashless1 Aztek")
+    if "cashless" in low and "2" in low and "aztek" in low:
+        return ("CA Cashless2 Aztek" if is_ca else "Vente Cashless2 Aztek")
+    if ("cashless" in low and "1" in low):
+        return ("CA Cashless1" if is_ca else "Vente Cashless1")
+    if ("cashless" in low and "2" in low):
+        return ("CA Cashless2" if is_ca else "Vente Cashless2")
+    if any(w in low for w in ["espèces","especes","cash "]):
+        return ("CA Espece" if is_ca else "Vente Espece")
+    if "total" in low:
+        return ("CA total" if is_ca else "Vente Total")
+    return None
+
+def parse_blocks_adaptive(text: str) -> dict:
+    """
+    Lecture par lignes :
+    - détecte entête colonnes (Cumul/Cumulation | Interim | Interim 2)
+    - pour chaque ligne portant un libellé connu (CA/VENTES), récupère 1 à 3 chiffres dans les lignes proches
+    - si pas d'entête colonnes trouvée, on scanne quand même 2-3 lignes autour
+    """
+    out = {}
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    lines_norm = [norm_spaces_keep_lines(ln) for ln in lines]
+
+    # header colonnes (optionnel)
+    header_idx, _ = find_col_header_positions(lines_norm)
+
+    def feed_section(is_ca: bool):
+        for i, ln in enumerate(lines_norm):
+            canon = canonical_from_line(ln, is_ca=is_ca)
+            if not canon:
+                continue
+            # point de départ pour chercher chiffres : si header connu, prends à partir de la même ligne, sinon ligne courante
+            start = i if header_idx is None else max(i, header_idx)
+            nums = parse_numbers_from_near(lines_norm, start, max_span=6)
+            a, b, c = (nums + ["", "", ""])[:3]
+            out[f"{canon}_Cumul"] = a
+            out[f"{canon}_Interim"] = b
+            out[f"{canon}_Interim2"] = c
+
+    # passe CA puis Ventes
+    feed_section(is_ca=True)
+    feed_section(is_ca=False)
+    return out
+
 def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
-    raw_text = run_pdftotext(str(pdf_path)) or run_tesseract_cli_on_pdf(str(pdf_path))
+    # 1) extraction texte
+    raw_text = extract_text_any(str(pdf_path))
     text = norm_spaces_keep_lines(raw_text)
     row = {k: "" for k in HEADERS}
     if not text.strip():
         row["id"] = pdf_path.stem
         return row, False
 
+    # 2) entête + codes
     row.update(parse_header(text))
     row.update(extract_codes_and_key(text))
 
-    # mapping FR
-    ca_map = {
-        "Total": "CA total",
-        "Espèces": "CA Espece",
-        "Cash": "CA Espece",
-        "Cashless 1": "CA Cashless1",
-        "Cashless turnover 1": "CA Cashless1",
-        "Cashless 1 Aztek": "CA Cashless1 Aztek",
-        "Aztek cashless turnover 1": "CA Cashless1 Aztek",
-        "Cashless 2": "CA Cashless2",
-        "Cashless turnover 2": "CA Cashless2",
-        "Cashless 2 Aztek": "CA Cashless2 Aztek",
-        "Aztek cashless turnover 2": "CA Cashless2 Aztek",
-    }
-    ventes_map = {
-        "Total": "Vente Total",
-        "Espèces": "Vente Espece",
-        "Cash": "Vente Espece",
-        "Cashless 1": "Vente Cashless1",
-        "Cashless vends 1": "Vente Cashless1",
-        "Cashless 1 Aztek": "Vente Cashless1 Aztek",
-        "Aztek cashless vends 1": "Vente Cashless1 Aztek",
-        "Cashless 2": "Vente Cashless2",
-        "Cashless vends 2": "Vente Cashless2",
-        "Cashless 2 Aztek": "Vente Cashless2 Aztek",
-        "Aztek cashless vends 2": "Vente Cashless2 Aztek",
-    }
+    # 3) parsing adaptatif
+    parsed = parse_blocks_adaptive(text)
+    row.update(parsed)
 
-    # mapping EN (où le 'prefix' est après le label: "Total turnover", "Total vends")
-    ca_en_map = {
-        "Total turnover": "CA total",
-        "Cash turnover": "CA Espece",
-        "Cashless turnover 1": "CA Cashless1",
-        "Aztek cashless turnover 1": "CA Cashless1 Aztek",
-        "Cashless turnover 2": "CA Cashless2",
-        "Aztek cashless turnover 2": "CA Cashless2 Aztek",
-    }
-    ventes_en_map = {
-        "Total vends": "Vente Total",
-        "Cash vends": "Vente Espece",
-        "Cashless vends 1": "Vente Cashless1",
-        "Aztek cashless vends 1": "Vente Cashless1 Aztek",
-        "Cashless vends 2": "Vente Cashless2",
-        "Aztek cashless vends 2": "Vente Cashless2 Aztek",
-    }
-
-    # FR (formes "prefix label")
-    row.update(parse_blocks(text, "CA", ca_map))
-    row.update(parse_blocks(text, "Ventes", ventes_map))
-
-    # EN (formes "label prefix" -> pas de prefix imposé)
-    row.update(parse_blocks(text, "", ca_en_map))
-    row.update(parse_blocks(text, "", ventes_en_map))
-
-    # -------- Garde-fous élargis (moins stricts) --------
+    # 4) score de complétude (N champs CA/Vente numériques)
     def _is_num(s):
         try:
             float(s)
@@ -258,11 +345,27 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
         except:
             return False
 
-    # Au moins UNE valeur numérique trouvée dans TOUTES les colonnes CA/Vente
-    if not any(_is_num(v) for k, v in row.items() if k.startswith(("CA", "Vente"))):
-        return row, False
+    numeric_count = sum(1 for k, v in row.items()
+                        if (k.startswith("CA ") or k.startswith("Vente ")) and _is_num(v))
+    ok = numeric_count >= MIN_NUMERIC_FIELDS
 
-    return row, True
+    # 5) debug si KO
+    if not ok:
+        dbg_txt = pdf_path.with_suffix(".dbg.txt")
+        dbg_rows = pdf_path.with_suffix(".dbg.rows.jsonl")
+        try:
+            dbg_txt.write_text(text, encoding="utf-8", errors="ignore")
+            with dbg_rows.open("w", encoding="utf-8") as f:
+                for ln in text.splitlines():
+                    tokens = [clean_num_tok(x) for x in TOKEN_RE.findall(ln)]
+                    json.dump({"line": ln, "num_tokens": tokens}, f, ensure_ascii=False)
+                    f.write("\n")
+        except Exception:
+            pass
+
+    return row, ok
+
+# ========= SORTIE / UI =========
 
 def print_summary(total, ok, errors, failed_files, out_csv):
     last_update = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -274,9 +377,9 @@ def print_summary(total, ok, errors, failed_files, out_csv):
     if failed_files:
         tf = Table(title="Fichiers en échec", box=HEAVY, show_header=True, expand=True)
         tf.add_column("Nom du fichier", style="err")
-        for name in failed_files:
-            tf.add_row(name)
+        for name in failed_files: tf.add_row(name)
         console.print(tf)
+        console.print("[dim]Des fichiers .dbg.txt et .dbg.rows.jsonl ont été générés à côté des PDFs en échec.[/dim]")
     panel_text = f"[ok][OK][/ok] Export : [hl]{out_csv}[/hl]\n📅 Mis à jour le [hl]{last_update}[/hl]\n[dim]Historique conservé[/dim]"
     console.print(Panel(panel_text, title="Fichier export", border_style="info"))
 
@@ -320,7 +423,6 @@ def main():
     total, errors, ok = len(pdfs), len(failed_files), len(pdfs)-len(failed_files)
     print_summary(total, ok, errors, failed_files, OUT_CSV)
 
-    # ✅ Bloc de fin : affichage + temporisation
     console.print("\n[bold green]Merci d'avoir utilisé l'outil d'analyse PDF ![/bold green]")
     console.print("[cyan]Cette fenêtre se fermera automatiquement dans 10 minutes.[/cyan]")
     console.print("[dim]Vous pouvez également la fermer manuellement en cliquant sur la croix.[/dim]\n")
