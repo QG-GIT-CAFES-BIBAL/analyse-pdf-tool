@@ -275,6 +275,6 @@ import time
 
 if __name__ == "__main__":
     main()
-    console.print("\n[info]Cette fenêtre se fermera automatiquement dans 10 minutes...[/info]")
-    console.print("[dim]Vous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
+    console.print("\n[dim]Cette fenêtre se fermera automatiquement dans 10 minutes...\nVous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
+    import time
     time.sleep(600)
