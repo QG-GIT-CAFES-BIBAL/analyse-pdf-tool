@@ -187,28 +187,48 @@ def print_summary(total, ok, errors, failed_files, out_csv):
 
 def main():
     pdfs = sorted([ROOT/f for f in os.listdir(ROOT) if f.lower().endswith(".pdf")])
-    if not pdfs: console.print("[warn][INFO][/warn] Aucun PDF trouvé dans le dossier."); return
+    if not pdfs: 
+        console.print("[warn][INFO][/warn] Aucun PDF trouvé dans le dossier.")
+        return
+
     results, failed_files = [], []
-    with Progress(TextColumn("[bold blue]🔍 Analyse[/bold blue] {task.fields[filename]}"),
-                  BarColumn(bar_width=None, complete_style="green", finished_style="bold green", pulse_style="yellow"),
-                  "[progress.percentage]{task.percentage:>3.0f}%",TimeElapsedColumn(),TimeRemainingColumn(),
-                  console=console, transient=True) as progress:
+    with Progress(
+        TextColumn("[bold blue]🔍 Analyse[/bold blue] {task.fields[filename]}"),
+        BarColumn(bar_width=None, complete_style="green", finished_style="bold green", pulse_style="yellow"),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeElapsedColumn(),TimeRemainingColumn(),
+        console=console, transient=True
+    ) as progress:
         task = progress.add_task("Analyse", total=len(pdfs), filename="")
         for pdf in pdfs:
             progress.update(task, filename=pdf.name)
-            try: row, ok = process_pdf(pdf); results.append(row); 
-            except Exception: r={k:"" for k in HEADERS}; r["id"]=pdf.stem; results.append(r); failed_files.append(pdf.name)
-            finally: progress.advance(task)
+            try:
+                row, ok = process_pdf(pdf)
+                results.append(row)
+            except Exception:
+                r = {k:"" for k in HEADERS}
+                r["id"] = pdf.stem
+                results.append(r)
+                failed_files.append(pdf.name)
+            finally:
+                progress.advance(task)
+
     file_exists = OUT_CSV.exists()
     with open(OUT_CSV,"a",newline="",encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=HEADERS)
-        if not file_exists: writer.writeheader(); writer.writerows(results)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(results)
+
     total, errors, ok = len(pdfs), len(failed_files), len(pdfs)-len(failed_files)
     print_summary(total,ok,errors,failed_files,OUT_CSV)
+
+    # ✅ Bloc de fin : affichage + temporisation
     console.print("\n[bold green]Merci d'avoir utilisé l'outil d'analyse PDF ![/bold green]")
-console.print("[cyan]Cette fenêtre se fermera automatiquement dans 10 minutes.[/cyan]")
-console.print("[dim]Vous pouvez également la fermer manuellement en cliquant sur la croix.[/dim]\n")
-time.sleep(600)
+    console.print("[cyan]Cette fenêtre se fermera automatiquement dans 10 minutes.[/cyan]")
+    console.print("[dim]Vous pouvez également la fermer manuellement en cliquant sur la croix.[/dim]\n")
+    time.sleep(600)
 
 
-if __name__=="__main__": main()
+if __name__=="__main__":
+    main()
