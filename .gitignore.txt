@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Build PyInstaller
+build/
+dist/
+*.spec
+
+# Executables et DLL
+*.exe
+*.dll
+*.pyd
+
+# Ressources locales lourdes
+dist_bundle_ressources/
+
+# Fichiers générés
+export_analyse_pdf.csv
