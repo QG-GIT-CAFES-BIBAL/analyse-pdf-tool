@@ -15,7 +15,6 @@ import tempfile
 import sys
 from pathlib import Path
 from datetime import datetime
-import time
 
 # ---------- UI (Rich) ----------
 from rich.progress import (
@@ -147,22 +146,26 @@ def extract_codes_and_key(text: str) -> dict:
         out["key 1"] = k1
     return out
 
-_NUM = r"([0-9][0-9\s.,]*€?)"
+# Regex séparés
+_NUM_CA = r"([0-9][0-9\s.,]*€?)"   # Pour CA (avec €)
+_NUM_VENTE = r"(\d{1,6})"          # Pour Ventes (entiers simples max 6 chiffres)
+
 def _clean_num(s: str) -> str:
     return re.sub(r"\s+", "", s or "").replace("€", "")
 
-def grab_triple_multiline(text: str, prefix: str, label: str):
+def grab_triple_multiline(text: str, prefix: str, label: str, is_vente=False):
+    regex = _NUM_VENTE if is_vente else _NUM_CA
     m = re.search(rf"{prefix}\s+{label}", text, flags=re.IGNORECASE)
     if m:
         window = text[m.end():m.end()+220]
-        nums = re.findall(_NUM, window)
+        nums = re.findall(regex, window)
         return tuple(_clean_num(x) for x in (nums[:3] + ["", "", ""])[:3])
     return "","",""
 
-def parse_blocks(text: str, prefix: str, label_map: dict) -> dict:
+def parse_blocks(text: str, prefix: str, label_map: dict, is_vente=False) -> dict:
     out = {}
     for label_src, col_base in label_map.items():
-        x,y,z = grab_triple_multiline(text, prefix, label_src)
+        x,y,z = grab_triple_multiline(text, prefix, label_src, is_vente=is_vente)
         out[f"{col_base}_Cumul"]    = x
         out[f"{col_base}_Interim"]  = y
         out[f"{col_base}_Interim2"] = z
@@ -204,8 +207,8 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
     ca_map = {"Total": "CA total","Espèces": "CA Espece","Cashless 1": "CA Cashless1","Cashless 1 Aztek": "CA Cashless1 Aztek","Cashless 2": "CA Cashless2","Cashless 2 Aztek": "CA Cashless2 Aztek"}
     ventes_map = {"Total": "Vente Total","Espèces": "Vente Espece","Cashless 1": "Vente Cashless1","Cashless 1 Aztek": "Vente Cashless1 Aztek","Cashless 2": "Vente Cashless2","Cashless 2 Aztek": "Vente Cashless2 Aztek"}
 
-    row.update(parse_blocks(text, "CA", ca_map))
-    row.update(parse_blocks(text, "Ventes", ventes_map))
+    row.update(parse_blocks(text, "CA", ca_map, is_vente=False))
+    row.update(parse_blocks(text, "Ventes", ventes_map, is_vente=True))
 
     return row, True
 
@@ -268,10 +271,9 @@ def main():
     total, errors, ok = len(pdfs), len(failed_files), len(pdfs)-len(failed_files)
     print_summary(total, ok, errors, failed_files, OUT_CSV)
 
-    # Message + délai avant fermeture
-    console.print("\n[dim]Cette fenêtre se fermera automatiquement dans 10 minutes...\nVous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
-    time.sleep(600)
-
+    console.print("\n[info]Cette fenêtre se fermera automatiquement dans 10 minutes...[/info]")
+    console.print("[dim]Vous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
+    import time; time.sleep(600)
 
 if __name__ == "__main__":
     main()
