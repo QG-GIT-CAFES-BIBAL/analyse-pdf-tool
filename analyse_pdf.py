@@ -15,6 +15,7 @@ import tempfile
 import sys
 from pathlib import Path
 from datetime import datetime
+import time
 
 # ---------- UI (Rich) ----------
 from rich.progress import (
@@ -267,14 +268,10 @@ def main():
     total, errors, ok = len(pdfs), len(failed_files), len(pdfs)-len(failed_files)
     print_summary(total, ok, errors, failed_files, OUT_CSV)
 
-    console.print("\n[dim]Cette fenêtre se fermera automatiquement dans 10 minutes...")
-    console.print("Vous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
-    import time; time.sleep(600)
+    # Message + délai avant fermeture
+    console.print("\n[dim]Cette fenêtre se fermera automatiquement dans 10 minutes...\nVous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
+    time.sleep(600)
 
-import time
 
 if __name__ == "__main__":
     main()
-    console.print("\n[dim]Cette fenêtre se fermera automatiquement dans 10 minutes...\nVous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
-    import time
-    time.sleep(600)
