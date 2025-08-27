@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Analyse des PDFs (Touch N Pay) -> CSV (v4 - parsing par flux)
-- Extraction texte multi-stratégies : Poppler (pdftotext) layout/raw, PyPDF2 (fallback), OCR Tesseract en dernier recours
-- Parsing par flux (token stream) : pour chaque libellé (FR/EN), on prend les 3 premiers nombres qui suivent
-  => remplit Cumul / Interim / Interim2 sans dépendre d'un en-tête ou d'un alignement
+Analyse des PDFs (Touch N Pay) -> CSV (v5 - double extraction + double parsing + fusion)
+- 2 extractions texte complémentaires : pdftotext -layout puis pdftotext -raw (fallback PyPDF2/OCR si besoin)
+- 2 parsings complémentaires : fenêtre 400 (rapprochée) puis 800 (élargie)
+- Sélection du meilleur résultat par score (nb de champs numériques trouvés) + merge pour combler les trous
 - Normalisation chiffres (espace, virgule/point, €)
-- Score de complétude (configurable) + fichiers debug pour chaque échec
+- Debug auto si score faible
 """
 
 import os, re, csv, subprocess, tempfile, sys, time, json
@@ -120,22 +120,51 @@ def run_tesseract_cli_on_pdf(pdf_path: str) -> str:
     except Exception:
         return ""
 
-def extract_text_any(pdf_path: str) -> str:
-    txt = run_pdftotext(pdf_path, "layout")
-    if strip_ok(txt): return txt
-    txt = run_pdftotext(pdf_path, "raw")
-    if strip_ok(txt): return txt
-    txt = run_pypdf2(pdf_path)
-    if strip_ok(txt): return txt
-    txt = run_tesseract_cli_on_pdf(pdf_path)
-    return txt
+def extract_text_strategy(pdf_path: str, strategy: str) -> str:
+    """
+    strategy: 'layout' | 'raw' | 'pypdf2' | 'ocr'
+    """
+    if strategy == "layout":
+        return run_pdftotext(pdf_path, "layout")
+    if strategy == "raw":
+        return run_pdftotext(pdf_path, "raw")
+    if strategy == "pypdf2":
+        return run_pypdf2(pdf_path)
+    if strategy == "ocr":
+        return run_tesseract_cli_on_pdf(pdf_path)
+    return ""
+
+def extract_text_double(pdf_path: str) -> tuple[str, str]:
+    """
+    Retourne (text1, text2) pour deux passes d'extraction différentes.
+    - Pass 1 : pdftotext -layout (fallback pypdf2/ocr si vide)
+    - Pass 2 : pdftotext -raw (fallback pypdf2/ocr si vide ET différent de pass1)
+    """
+    # pass 1
+    t1 = extract_text_strategy(pdf_path, "layout")
+    if not t1.strip():
+        t1 = extract_text_strategy(pdf_path, "pypdf2")
+    if not t1.strip():
+        t1 = extract_text_strategy(pdf_path, "ocr")
+
+    # pass 2
+    t2 = extract_text_strategy(pdf_path, "raw")
+    if not t2.strip():
+        t2 = extract_text_strategy(pdf_path, "pypdf2")
+    if not t2.strip():
+        t2 = extract_text_strategy(pdf_path, "ocr")
+
+    # si t2 == t1 (possible), on force une seule passe utile
+    if t2.strip() == t1.strip():
+        t2 = ""
+    return t1, t2
 
 def strip_ok(s: str) -> bool:
     return bool(s and s.strip())
 
 # ========= PARSING =========
 
-# Numéros "propres" (gère 123 456,78€ / 123,45 / 123.45 / -12 etc.)
+# Numéros "propres"
 NUM_TOKEN = r"-?\d+(?:[.,]\d+)?(?:\s*€)?"
 TOKEN_RE = re.compile(NUM_TOKEN)
 
@@ -201,51 +230,34 @@ def extract_codes_and_key(text: str) -> dict:
     return out
 
 def to_flat(text: str) -> str:
-    # On garde des espaces simples et des \n pour délimiter visuellement, mais la recherche se fait sur le flux
     return re.sub(r"[ \u00A0]+", " ", text)
 
-def find_numbers_ahead(flat: str, start_pos: int, max_chars: int = 300, max_tokens: int = 3) -> list[str]:
-    """
-    Depuis la position 'start_pos' dans le flux, cherche les prochains tokens numériques
-    dans une fenêtre de 'max_chars' caractères, et retourne jusqu'à 'max_tokens' valeurs nettoyées.
-    """
+def find_numbers_ahead(flat: str, start_pos: int, max_chars: int = 400, max_tokens: int = 3) -> list[str]:
     window = flat[start_pos : start_pos + max_chars]
     toks = [clean_num_tok(t) for t in TOKEN_RE.findall(window)]
     return [t for t in toks if t][:max_tokens]
 
 def compile_variants_map(label_map: dict) -> list[tuple[str, str, re.Pattern]]:
-    """
-    Retourne une liste de tuples (canonique, variante, pattern_compilé) pour chercher chaque variante dans le flux.
-    On matche sur des mots/segments, insensible à la casse, et on évite de confondre avec 'Free code' / 'key 1'.
-    """
     res = []
     for canon, variants in label_map.items():
         for v in variants:
-            # pattern permissif mais protège: pas "free code", pas "key 1"
             pat = re.compile(rf"(?<!free\s)({re.escape(v)})", re.IGNORECASE)
             res.append((canon, v, pat))
     return res
 
 VARIANTS = compile_variants_map(LABELS_CA) + compile_variants_map(LABELS_VENTES)
 
-def parse_blocks_stream(text: str) -> dict:
-    """
-    Parsing par flux :
-    - On normalise en 'flat' (espaces simples)
-    - Pour chaque variante de libellé, on cherche sa première occurrence et on prend les 3 nombres qui suivent
-    - Si on trouve plusieurs occurrences du même canonique, on garde la première qui a >=1 nombre
-    """
+def parse_blocks_stream(text: str, win_chars: int = 400) -> dict:
     out = {}
     flat = to_flat(text)
-
     seen = set()
     for canon, var, pat in VARIANTS:
-        if canon in seen:
+        if canon in seen: 
             continue
         m = pat.search(flat)
         if not m:
             continue
-        nums = find_numbers_ahead(flat, m.end(), max_chars=400, max_tokens=3)
+        nums = find_numbers_ahead(flat, m.end(), max_chars=win_chars, max_tokens=3)
         a, b, c = (nums + ["", "", ""])[:3]
         if any(x for x in (a, b, c)):
             out[f"{canon}_Cumul"] = a
@@ -254,43 +266,74 @@ def parse_blocks_stream(text: str) -> dict:
             seen.add(canon)
     return out
 
+def numeric_score(d: dict) -> int:
+    def _is_num(s):
+        try: float(s); return True
+        except: return False
+    return sum(1 for k, v in d.items()
+               if (k.startswith("CA ") or k.startswith("Vente ")) and _is_num(v))
+
+def smart_merge(a: dict, b: dict) -> dict:
+    """Fusionne deux parsings: on garde la valeur de a, mais si vide dans a et présente dans b -> on prend b"""
+    out = dict(a)
+    for k, v in b.items():
+        if (k not in out) or (not out[k] and v):
+            out[k] = v
+    return out
+
 def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
-    # 1) extraction texte
-    raw_text = extract_text_any(str(pdf_path))
-    text = norm_spaces_keep_lines(raw_text)
     row = {k: "" for k in HEADERS}
-    if not text.strip():
+
+    # 1) extractions texte (2 stratégies)
+    t1, t2 = extract_text_double(str(pdf_path))
+    t1 = norm_spaces_keep_lines(t1)
+    t2 = norm_spaces_keep_lines(t2)
+
+    if not strip_ok(t1) and not strip_ok(t2):
         row["id"] = pdf_path.stem
         return row, False
 
-    # 2) entête + codes
-    row.update(parse_header_section(text))
-    row.update(extract_codes_and_key(text))
+    # 2) entête + codes (depuis la meilleure source dispo)
+    src_header = t1 if strip_ok(t1) else t2
+    row.update(parse_header_section(src_header))
+    row.update(extract_codes_and_key(src_header))
 
-    # 3) parsing par flux
-    parsed = parse_blocks_stream(text)
-    row.update(parsed)
+    # 3) parsing par flux (2 fenêtres * 2 textes)
+    parsed_variants = []
 
-    # 4) score de complétude
-    def _is_num(s):
-        try:
-            float(s); return True
-        except:
-            return False
+    if strip_ok(t1):
+        p1_t1 = parse_blocks_stream(t1, win_chars=400)
+        p2_t1 = parse_blocks_stream(t1, win_chars=800)
+        parsed_variants += [p1_t1, p2_t1]
 
-    numeric_count = sum(1 for k, v in row.items()
-                        if (k.startswith("CA ") or k.startswith("Vente ")) and _is_num(v))
-    ok = numeric_count >= MIN_NUMERIC_FIELDS
+    if strip_ok(t2):
+        p1_t2 = parse_blocks_stream(t2, win_chars=400)
+        p2_t2 = parse_blocks_stream(t2, win_chars=800)
+        parsed_variants += [p1_t2, p2_t2]
 
-    # 5) debug si KO
+    # 4) choisir le meilleur puis fusionner intelligemment pour combler les trous
+    if parsed_variants:
+        best = max(parsed_variants, key=numeric_score)
+        # merge toutes les autres variantes pour compléter
+        merged = dict(best)
+        for pv in parsed_variants:
+            if pv is best: 
+                continue
+            merged = smart_merge(merged, pv)
+        row.update(merged)
+
+    # 5) score de complétude
+    ok = numeric_score(row) >= MIN_NUMERIC_FIELDS
+
+    # 6) debug si KO
     if not ok:
         try:
-            pdf_path.with_suffix(".dbg.txt").write_text(text, encoding="utf-8", errors="ignore")
-            with pdf_path.with_suffix(".dbg.tokens.jsonl").open("w", encoding="utf-8") as f:
-                flat = to_flat(text)
-                for m in TOKEN_RE.finditer(flat):
-                    json.dump({"pos": m.start(), "tok": clean_num_tok(m.group())}, f, ensure_ascii=False)
-                    f.write("\n")
+            if strip_ok(t1):
+                pdf_path.with_suffix(".dbg.pass1.txt").write_text(t1, encoding="utf-8", errors="ignore")
+            if strip_ok(t2):
+                pdf_path.with_suffix(".dbg.pass2.txt").write_text(t2, encoding="utf-8", errors="ignore")
+            with pdf_path.with_suffix(".dbg.best.json").open("w", encoding="utf-8") as f:
+                json.dump({k: v for k, v in row.items() if k.startswith(("CA ", "Vente "))}, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
@@ -309,7 +352,7 @@ def print_summary(total, ok, errors, failed_files, out_csv):
         tf.add_column("Nom du fichier", style="err")
         for name in failed_files: tf.add_row(name)
         console.print(tf)
-        console.print("[dim]Des fichiers .dbg.txt et .dbg.tokens.jsonl ont été générés à côté des PDFs en échec.[/dim]")
+        console.print("[dim]Des fichiers .dbg.pass1.txt / .dbg.pass2.txt et .dbg.best.json ont été générés à côté des PDFs en échec.[/dim]")
     panel_text = f"[ok][OK][/ok] Export : [hl]{out_csv}[/hl]\n📅 Mis à jour le [hl]{last_update}[/hl]\n[dim]Historique conservé[/dim]"
     console.print(Panel(panel_text, title="Fichier export", border_style="info"))
 
