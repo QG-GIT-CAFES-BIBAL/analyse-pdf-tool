@@ -2,25 +2,16 @@
 """
 Analyse des PDFs (Touch N Pay) -> CSV
 - Extraction via pdftotext (Poppler), fallback OCR via Tesseract (CLI)
-- Barre de progression colorée (Rich)
-- Résumé final "pro": tableau coloré + panel du fichier export
-- Historique conservé dans export_analyse_pdf.csv (append au lieu d'écraser)
+- Résumé final avec tableau
+- Historique conservé dans export_analyse_pdf.csv
 """
 
-import os
-import re
-import csv
-import subprocess
-import tempfile
-import sys
+import os, re, csv, subprocess, tempfile, sys, time
 from pathlib import Path
 from datetime import datetime
-import time
 
 # ---------- UI (Rich) ----------
-from rich.progress import (
-    Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
-)
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
 from rich.theme import Theme
 from rich.table import Table
@@ -36,7 +27,7 @@ console = Console(theme=Theme({
     "dim": "dim",
 }))
 
-# ========= CONFIG DYNAMIQUE =========
+# ========= CONFIG =========
 if getattr(sys, 'frozen', False):
     BASE_DIR = Path.home() / "Documents" / "AnalysePDF"
 else:
@@ -49,17 +40,11 @@ RESSOURCES_DIR = BASE_DIR / "dist_bundle_ressources"
 ROOT.mkdir(parents=True, exist_ok=True)
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Poppler
-POPPLER_BIN = RESSOURCES_DIR / "poppler-bin"
-PDFTOTEXT   = str(POPPLER_BIN / "pdftotext.exe")
-PDFTOPPM    = str(POPPLER_BIN / "pdftoppm.exe")
-
-# Tesseract
+PDFTOTEXT   = str(RESSOURCES_DIR / "poppler-bin" / "pdftotext.exe")
+PDFTOPPM    = str(RESSOURCES_DIR / "poppler-bin" / "pdftoppm.exe")
 TESSERACT_EXE = str(RESSOURCES_DIR / "tesseract" / "tesseract.exe")
 TESSDATA_DIR  = str(RESSOURCES_DIR / "tesseract" / "tessdata")
 TESS_LANG     = "fra+eng"
-
-ENABLE_OCR_FALLBACK = True
 
 # ========= HELPERS =========
 def norm_spaces_keep_lines(s: str) -> str:
@@ -74,8 +59,6 @@ def get_first(regex, text, flags=0):
     return m.group(1).strip() if m else ""
 
 def run_pdftotext(pdf_path: str) -> str:
-    if not os.path.isfile(PDFTOTEXT):
-        return ""
     try:
         with tempfile.TemporaryDirectory() as td:
             out_txt = Path(td) / "out.txt"
@@ -85,46 +68,11 @@ def run_pdftotext(pdf_path: str) -> str:
     except Exception:
         return ""
 
-def run_tesseract_cli_on_pdf(pdf_path: str) -> str:
-    if not ENABLE_OCR_FALLBACK:
-        return ""
-    if not os.path.isfile(PDFTOPPM) or not os.path.isfile(TESSERACT_EXE):
-        return ""
-    full_text = ""
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            out_prefix = Path(td) / "page"
-            cmd_ppm = [PDFTOPPM, "-png", "-r", "450", pdf_path, str(out_prefix)]
-            subprocess.run(cmd_ppm, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=0x08000000)
-            imgs = sorted(Path(td).glob("page*.png"))
-            with Progress(
-                TextColumn("  [info]OCR[/info] {task.completed}/{task.total} page(s)"),
-                BarColumn(bar_width=None, complete_style="green", finished_style="bold green", pulse_style="yellow"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True,
-            ) as p_ocr:
-                task = p_ocr.add_task("OCR pages", total=len(imgs))
-                for i, img in enumerate(imgs, 1):
-                    txt_out = Path(td) / f"ocr_{i}"
-                    cmd_tess = [
-                        TESSERACT_EXE, str(img), str(txt_out),
-                        "-l", TESS_LANG, "--psm", "6", "--oem", "1",
-                        "--tessdata-dir", TESSDATA_DIR
-                    ]
-                    subprocess.run(cmd_tess, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=0x08000000)
-                    part = (txt_out.with_suffix(".txt")).read_text(encoding="utf-8", errors="ignore")
-                    full_text += part + "\n"
-                    p_ocr.advance(task)
-        return full_text
-    except Exception:
-        return ""
-
 # ========= PARSING =========
 def parse_header(text: str) -> dict:
     lines = [ln for ln in text.splitlines() if ln.strip()]
     joined = "\n".join(lines)
-    id_val = ""
+    id_val, date_val, num_rel = "", "", ""
     for ln in lines[:150]:
         if "TOUCH" in ln.upper():
             id_val = squash(ln)
@@ -140,57 +88,47 @@ def extract_codes_and_key(text: str) -> dict:
     for idx, val in re.findall(r"Code\s+gratuit\s+(\d+)\s*:\s*([0-9]+(?:\*\*[0-9]/[0-9])?)", flat, flags=re.IGNORECASE):
         out[f"Code gratuit {idx}"] = val
     k1 = get_first(r"\bkey\s+1\s*:\s*([A-Za-z0-9]+)", flat, flags=re.IGNORECASE)
-    if k1:
-        out["key 1"] = k1
+    if k1: out["key 1"] = k1
     return out
 
-# Regex séparées
-_NUM_CA = r"([0-9][0-9\s.,]*)(?=€)"
-_NUM_VENTES = r"([0-9]{1,10})"
+def _clean_num(s: str) -> str:
+    return re.sub(r"[^\d]", "", s or "")
 
-def grab_triple_multiline(text: str, prefix: str, label: str, is_ca=True):
+def grab_triple_multiline(text: str, prefix: str, label: str, strict=False):
     m = re.search(rf"{prefix}\s+{label}", text, flags=re.IGNORECASE)
     if m:
         window = text[m.end():m.end()+220]
-        nums = re.findall(_NUM_CA if is_ca else _NUM_VENTES, window)
-        return tuple(nums[:3] + ["", "", ""])[:3]
+        if strict:  # Ventes → limiter à blocs de 1-6 chiffres
+            nums = re.findall(r"\b\d{1,6}\b", window)
+        else:       # CA → nombres normaux
+            nums = re.findall(r"\d+", window)
+        return tuple(_clean_num(x) for x in (nums[:3] + ["", "", ""])[:3])
     return "","",""
 
-def parse_blocks(text: str, prefix: str, label_map: dict, is_ca=True) -> dict:
+def parse_blocks(text: str, prefix: str, label_map: dict, strict=False) -> dict:
     out = {}
     for label_src, col_base in label_map.items():
-        x,y,z = grab_triple_multiline(text, prefix, label_src, is_ca)
+        x,y,z = grab_triple_multiline(text, prefix, label_src, strict=strict)
         out[f"{col_base}_Cumul"]    = x
         out[f"{col_base}_Interim"]  = y
         out[f"{col_base}_Interim2"] = z
     return out
 
 HEADERS = [
-    "id", "date", "Numéro de relevé",
+    "id","date","Numéro de relevé",
     "CA total_Cumul","CA total_Interim","CA total_Interim2",
     "CA Espece_Cumul","CA Espece_Interim","CA Espece_Interim2",
-    "CA Cashless1_Cumul","CA Cashless1_Interim","CA Cashless1_Interim2",
-    "CA Cashless1 Aztek_Cumul","CA Cashless1 Aztek_Interim","CA Cashless1 Aztek_Interim2",
-    "CA Cashless2_Cumul","CA Cashless2_Interim","CA Cashless2_Interim2",
-    "CA Cashless2 Aztek_Cumul","CA Cashless2 Aztek_Interim","CA Cashless2 Aztek_Interim2",
     "Vente Total_Cumul","Vente Total_Interim","Vente Total_Interim2",
     "Vente Espece_Cumul","Vente Espece_Interim","Vente Espece_Interim2",
-    "Vente Cashless1_Cumul","Vente Cashless1_Interim","Vente Cashless1_Interim2",
-    "Vente Cashless1 Aztek_Cumul","Vente Cashless1 Aztek_Interim","Vente Cashless1 Aztek_Interim2",
-    "Vente Cashless2_Cumul","Vente Cashless2_Interim","Vente Cashless2_Interim2",
-    "Vente Cashless2 Aztek_Cumul","Vente Cashless2 Aztek_Interim","Vente Cashless2 Aztek_Interim2",
-    "Code gratuit 1","Code gratuit 2","Code gratuit 3","Code gratuit 4","Code gratuit 5","Code gratuit 6","Code gratuit 7",
-    "key 1",
+    "Code gratuit 1","key 1"
 ]
 
 # ========= PIPELINE =========
-def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
+def process_pdf(pdf_path: Path) -> tuple[dict,bool]:
     raw_text = run_pdftotext(str(pdf_path))
-    if not raw_text.strip():
-        raw_text = run_tesseract_cli_on_pdf(str(pdf_path))
     text = norm_spaces_keep_lines(raw_text)
 
-    row = {k: "" for k in HEADERS}
+    row = {k:"" for k in HEADERS}
     if not text.strip():
         row["id"] = pdf_path.stem
         return row, False
@@ -198,11 +136,11 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
     row.update(parse_header(text))
     row.update(extract_codes_and_key(text))
 
-    ca_map = {"Total": "CA total","Espèces": "CA Espece","Cashless 1": "CA Cashless1","Cashless 1 Aztek": "CA Cashless1 Aztek","Cashless 2": "CA Cashless2","Cashless 2 Aztek": "CA Cashless2 Aztek"}
-    ventes_map = {"Total": "Vente Total","Espèces": "Vente Espece","Cashless 1": "Vente Cashless1","Cashless 1 Aztek": "Vente Cashless1 Aztek","Cashless 2": "Vente Cashless2","Cashless 2 Aztek": "Vente Cashless2 Aztek"}
+    ca_map = {"Total": "CA total","Espèces": "CA Espece"}
+    ventes_map = {"Total": "Vente Total","Espèces": "Vente Espece"}
 
-    row.update(parse_blocks(text, "CA", ca_map, is_ca=True))
-    row.update(parse_blocks(text, "Ventes", ventes_map, is_ca=False))
+    row.update(parse_blocks(text, "CA", ca_map, strict=False))
+    row.update(parse_blocks(text, "Ventes", ventes_map, strict=True))
 
     return row, True
 
@@ -214,13 +152,6 @@ def print_summary(total, ok, errors, failed_files, out_csv):
     table.add_row("❌ Erreurs", f"[err]{errors}[/err]")
     console.print(table)
 
-    if failed_files:
-        tf = Table(title="Fichiers en échec", box=HEAVY, show_header=True, expand=True)
-        tf.add_column("Nom du fichier", style="err")
-        for name in failed_files:
-            tf.add_row(name)
-        console.print(tf)
-
     panel_text = (
         f"[ok][OK][/ok] Export : [hl]{out_csv}[/hl]\n"
         f"📅 Mis à jour le [hl]{last_update}[/hl]\n"
@@ -229,34 +160,23 @@ def print_summary(total, ok, errors, failed_files, out_csv):
     console.print(Panel(panel_text, title="Fichier export", border_style="info"))
 
 def main():
-    pdfs = sorted([ROOT / f for f in os.listdir(ROOT) if f.lower().endswith(".pdf")])
+    pdfs = sorted([ROOT/f for f in os.listdir(ROOT) if f.lower().endswith(".pdf")])
     if not pdfs:
-        console.print("[warn][INFO][/warn] Aucun PDF trouvé dans le dossier.")
+        console.print("[warn]Aucun PDF trouvé dans le dossier.[/warn]")
         return
 
     results, failed_files = [], []
-
-    with Progress(
-        TextColumn("[bold blue]🔍 Analyse[/bold blue] {task.fields[filename]}"),
-        BarColumn(bar_width=None, complete_style="green", finished_style="bold green", pulse_style="yellow"),
-        "[progress.percentage]{task.percentage:>3.0f}%",
-        TimeElapsedColumn(), TimeRemainingColumn(), console=console, transient=True,
-    ) as progress:
-        task = progress.add_task("Analyse des PDF", total=len(pdfs), filename="")
-        for pdf in pdfs:
-            progress.update(task, filename=pdf.name)
-            try:
-                row, ok = process_pdf(pdf)
-                results.append(row)
-                if not ok: failed_files.append(pdf.name)
-            except Exception:
-                r = {k: "" for k in HEADERS}; r["id"] = pdf.stem
-                results.append(r); failed_files.append(pdf.name)
-            finally:
-                progress.advance(task)
+    for pdf in pdfs:
+        try:
+            row, ok = process_pdf(pdf)
+            results.append(row)
+            if not ok: failed_files.append(pdf.name)
+        except Exception:
+            r = {k:"" for k in HEADERS}; r["id"] = pdf.stem
+            results.append(r); failed_files.append(pdf.name)
 
     file_exists = OUT_CSV.exists()
-    with open(OUT_CSV, "a", newline="", encoding="utf-8") as f:
+    with open(OUT_CSV,"a",newline="",encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=HEADERS)
         if not file_exists: writer.writeheader()
         writer.writerows(results)
@@ -264,8 +184,8 @@ def main():
     total, errors, ok = len(pdfs), len(failed_files), len(pdfs)-len(failed_files)
     print_summary(total, ok, errors, failed_files, OUT_CSV)
 
-    console.print("\n[dim]Cette fenêtre se fermera automatiquement dans 10 minutes...")
-    console.print("Vous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
+    print("\nCette fenêtre se fermera automatiquement dans 10 minutes...")
+    print("Vous pouvez aussi la fermer directement en cliquant sur la croix.\n")
     time.sleep(600)
 
 if __name__ == "__main__":
