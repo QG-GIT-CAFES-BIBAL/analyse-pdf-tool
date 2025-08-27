@@ -120,7 +120,13 @@ HEADERS = [
     "CA Espece_Cumul","CA Espece_Interim","CA Espece_Interim2",
     "Vente Total_Cumul","Vente Total_Interim","Vente Total_Interim2",
     "Vente Espece_Cumul","Vente Espece_Interim","Vente Espece_Interim2",
-    "Code gratuit 1","key 1"
+    "Vente Cashless1_Cumul","Vente Cashless1_Interim","Vente Cashless1_Interim2",
+    "Vente Cashless1 Aztek_Cumul","Vente Cashless1 Aztek_Interim","Vente Cashless1 Aztek_Interim2",
+    "Vente Cashless2_Cumul","Vente Cashless2_Interim","Vente Cashless2_Interim2",
+    "Vente Cashless2 Aztek_Cumul","Vente Cashless2 Aztek_Interim","Vente Cashless2 Aztek_Interim2",
+    "Code gratuit 1","Code gratuit 2","Code gratuit 3","Code gratuit 4",
+    "Code gratuit 5","Code gratuit 6","Code gratuit 7",
+    "key 1"
 ]
 
 # ========= PIPELINE =========
