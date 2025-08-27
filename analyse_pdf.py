@@ -271,10 +271,6 @@ def main():
     console.print("Vous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
     import time; time.sleep(600)
 
-if __name__ == "__main__":
-    main()
-
-
 import time
 
 if __name__ == "__main__":
