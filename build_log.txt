@@ -1,0 +1,24 @@
+125 INFO: PyInstaller: 6.15.0, contrib hooks: 2025.8
+125 INFO: Python: 3.13.7
+149 INFO: Platform: Windows-11-10.0.26100-SP0
+149 INFO: Python environment: C:\Users\vianney.popeye\AppData\Local\Programs\Python\Python313
+149 INFO: wrote C:\Users\vianney.popeye\Documents\analyse_pdf_build\analyse_pdf.spec
+151 INFO: Module search paths (PYTHONPATH):
+['C:\\Users\\vianney.popeye\\AppData\\Local\\Programs\\Python\\Python313\\Scripts\\pyinstaller.exe',
+ 'C:\\Users\\vianney.popeye\\AppData\\Local\\Programs\\Python\\Python313\\python313.zip',
+ 'C:\\Users\\vianney.popeye\\AppData\\Local\\Programs\\Python\\Python313\\DLLs',
+ 'C:\\Users\\vianney.popeye\\AppData\\Local\\Programs\\Python\\Python313\\Lib',
+ 'C:\\Users\\vianney.popeye\\AppData\\Local\\Programs\\Python\\Python313',
+ 'C:\\Users\\vianney.popeye\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages',
+ 'C:\\Users\\vianney.popeye\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\setuptools\\_vendor',
+ 'C:\\Users\\vianney.popeye\\Documents\\analyse_pdf_build']
+359 INFO: Appending 'datas' from .spec
+361 INFO: checking Analysis
+361 INFO: Building Analysis because Analysis-00.toc is non existent
+361 INFO: Running Analysis Analysis-00.toc
+361 INFO: Target bytecode optimization level: 0
+361 INFO: Initializing module dependency graph...
+361 INFO: Initializing module graph hook caches...
+369 INFO: Analyzing modules for base_library.zip ...
+1249 INFO: Processing standard module hook 'hook-encodings.py' from 'C:\\Users\\vianney.popeye\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\PyInstaller\\hooks'
+1733 INFO: Processing standard module hook 'hook-heapq.py' from 'C:\\Users\\vianney.popeye\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\PyInstaller\\hooks'
