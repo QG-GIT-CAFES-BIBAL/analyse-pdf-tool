@@ -1,20 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Analyse des PDFs (Touch N Pay) -> CSV (v3 - robuste multi-layout)
+Analyse des PDFs (Touch N Pay) -> CSV (v4 - parsing par flux)
 - Extraction texte multi-stratégies : Poppler (pdftotext) layout/raw, PyPDF2 (fallback), OCR Tesseract en dernier recours
-- Parsing adaptatif par lignes (FR/EN) :
-    • Détection des libellés (Total/Espèces/Cash/Cashless 1/2 + variantes Aztek)
-    • Colonnes "Cumul/Cumulation" + "Interim" + "Interim 2" même si réparties sur plusieurs lignes
-- Anti-bruit : normalisation chiffres (espace, point, virgule, €), séparation fiable des tokens
-- Score de complétude : succès si ≥ 6 champs numériques CA/Ventes trouvés (configurable)
-- Debug : exports .dbg.txt (texte brut) et .dbg.rows.jsonl (lignes tokenisées) par PDF en cas d’échec (pour affiner vite)
+- Parsing par flux (token stream) : pour chaque libellé (FR/EN), on prend les 3 premiers nombres qui suivent
+  => remplit Cumul / Interim / Interim2 sans dépendre d'un en-tête ou d'un alignement
+- Normalisation chiffres (espace, virgule/point, €)
+- Score de complétude (configurable) + fichiers debug pour chaque échec
 """
 
 import os, re, csv, subprocess, tempfile, sys, time, json
 from pathlib import Path
 from datetime import datetime
 
-# UI
 from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
 from rich.theme import Theme
@@ -39,16 +36,16 @@ RESSOURCES_DIR = BASE_DIR / "dist_bundle_ressources"
 ROOT.mkdir(parents=True, exist_ok=True)
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Binaries (facultatifs suivant OS)
+# Binaries (selon OS)
 POPPLER_BIN = RESSOURCES_DIR / "poppler-bin"
 PDFTOTEXT = str(POPPLER_BIN / "pdftotext.exe") if os.name == "nt" else "pdftotext"
 PDFTOPPM  = str(POPPLER_BIN / "pdftoppm.exe")  if os.name == "nt" else "pdftoppm"
 TESSERACT_EXE = str(RESSOURCES_DIR / "tesseract" / "tesseract.exe") if os.name == "nt" else "tesseract"
 TESSDATA_DIR  = str(RESSOURCES_DIR / "tesseract" / "tessdata")
 TESS_LANG = "fra+eng"
-ENABLE_OCR_FALLBACK = True  # mettre False si tu veux éviter l’OCR
+ENABLE_OCR_FALLBACK = True
 
-# Seuil de réussite : au moins N champs CA/Ventes numériques trouvés
+# Seuil mini : au moins N champs CA/Ventes numériques pour considérer OK
 MIN_NUMERIC_FIELDS = 6
 
 # ========= HELPERS =========
@@ -123,18 +120,13 @@ def run_tesseract_cli_on_pdf(pdf_path: str) -> str:
     except Exception:
         return ""
 
-# ========= EXTRACTION TEXTE MULTI-STRAT =========
 def extract_text_any(pdf_path: str) -> str:
-    # 1) pdftotext -layout
     txt = run_pdftotext(pdf_path, "layout")
     if strip_ok(txt): return txt
-    # 2) pdftotext "raw"
     txt = run_pdftotext(pdf_path, "raw")
     if strip_ok(txt): return txt
-    # 3) PyPDF2
     txt = run_pypdf2(pdf_path)
     if strip_ok(txt): return txt
-    # 4) OCR
     txt = run_tesseract_cli_on_pdf(pdf_path)
     return txt
 
@@ -143,18 +135,16 @@ def strip_ok(s: str) -> bool:
 
 # ========= PARSING =========
 
+# Numéros "propres" (gère 123 456,78€ / 123,45 / 123.45 / -12 etc.)
 NUM_TOKEN = r"-?\d+(?:[.,]\d+)?(?:\s*€)?"
 TOKEN_RE = re.compile(NUM_TOKEN)
 
 def clean_num_tok(tok: str) -> str:
     if not tok: return ""
-    tok = tok.replace("€","").strip()
-    # sépare les espaces internes (ex: "145 142" -> "145","142") géré au niveau tokenisation par findall
-    return tok.replace(",", ".")
+    return tok.replace("€","").replace(",", ".").strip()
 
-# Synonymes / variantes
+# Canonicals et variantes (FR + EN)
 LABELS_CA = {
-    # label canonique -> liste de variantes attendues
     "CA total": ["CA Total","Total CA","Total","Total turnover"],
     "CA Espece": ["CA Espèces","CA Espece","Espèces","Cash","Cash turnover"],
     "CA Cashless1": ["Cashless 1","Cashless turnover 1"],
@@ -170,13 +160,6 @@ LABELS_VENTES = {
     "Vente Cashless2": ["Ventes Cashless 2","Vente Cashless 2","Cashless vends 2","Cashless sales 2"],
     "Vente Cashless2 Aztek": ["Ventes Cashless 2 Aztek","Vente Cashless 2 Aztek","Aztek cashless vends 2","Aztek sales 2"],
 }
-
-COL_HEADERS = [
-    # variantes colonnes (FR/EN) ; ordre attendu: Cumul/Cumulation, Interim, Interim 2
-    ["Cumul","Cumulation","Cumulated","Cumulative"],
-    ["Interim","Interim."],   # on laisse simple
-    ["Interim 2","Interim2","Interim2.","Interim. 2","Interim.2"]
-]
 
 HEADERS = [
     "id","date","Numéro de relevé",
@@ -195,7 +178,7 @@ HEADERS = [
     "Code gratuit 1","Code gratuit 2","Code gratuit 3","Code gratuit 4","Code gratuit 5","Code gratuit 6","Code gratuit 7","key 1"
 ]
 
-def parse_header(text: str) -> dict:
+def parse_header_section(text: str) -> dict:
     lines = [ln for ln in text.splitlines() if ln.strip()]
     joined = "\n".join(lines)
     id_val = ""
@@ -217,107 +200,58 @@ def extract_codes_and_key(text: str) -> dict:
     if k1: out["key 1"] = k1
     return out
 
-def match_any(token: str, variants: list[str]) -> bool:
-    t = token.lower()
-    for v in variants:
-        if t == v.lower(): return True
-        # tolère sans accents / casse partielle
-        if v.lower() in t: return True
-    return False
+def to_flat(text: str) -> str:
+    # On garde des espaces simples et des \n pour délimiter visuellement, mais la recherche se fait sur le flux
+    return re.sub(r"[ \u00A0]+", " ", text)
 
-def find_col_header_positions(lines_norm: list[str]) -> tuple[int|None, list[int]]:
+def find_numbers_ahead(flat: str, start_pos: int, max_chars: int = 300, max_tokens: int = 3) -> list[str]:
     """
-    Cherche la ligne d'entête contenant Cumul/Cumulation + Interim (+/- Interim 2).
-    Retourne (index_ligne, [positions numériques trouvées ensuite] -> ici on ne se sert que de l'index_ligne)
+    Depuis la position 'start_pos' dans le flux, cherche les prochains tokens numériques
+    dans une fenêtre de 'max_chars' caractères, et retourne jusqu'à 'max_tokens' valeurs nettoyées.
     """
-    for i, ln in enumerate(lines_norm[:200]):  # header plutôt haut
-        low = ln.lower()
-        ok_cumul = any(x.lower() in low for x in COL_HEADERS[0])
-        ok_inter = any(x.lower() in low for x in COL_HEADERS[1])
-        if ok_cumul and ok_inter:
-            return i, []
-    return None, []
+    window = flat[start_pos : start_pos + max_chars]
+    toks = [clean_num_tok(t) for t in TOKEN_RE.findall(window)]
+    return [t for t in toks if t][:max_tokens]
 
-def parse_numbers_from_near(lines_norm: list[str], start_idx: int, max_span: int = 6) -> list[str]:
+def compile_variants_map(label_map: dict) -> list[tuple[str, str, re.Pattern]]:
     """
-    Récupère jusqu'à 3 nombres à partir de start_idx sur quelques lignes suivantes.
-    Prend les 3 premiers tokens numériques distincts rencontrés.
+    Retourne une liste de tuples (canonique, variante, pattern_compilé) pour chercher chaque variante dans le flux.
+    On matche sur des mots/segments, insensible à la casse, et on évite de confondre avec 'Free code' / 'key 1'.
     """
-    nums = []
-    for j in range(start_idx, min(start_idx + max_span, len(lines_norm))):
-        for tok in TOKEN_RE.findall(lines_norm[j]):
-            val = clean_num_tok(tok)
-            if val:
-                nums.append(val)
-                if len(nums) >= 3:
-                    return nums[:3]
-    return nums[:3]
+    res = []
+    for canon, variants in label_map.items():
+        for v in variants:
+            # pattern permissif mais protège: pas "free code", pas "key 1"
+            pat = re.compile(rf"(?<!free\s)({re.escape(v)})", re.IGNORECASE)
+            res.append((canon, v, pat))
+    return res
 
-def build_reverse_index(label_map: dict) -> dict:
-    """
-    Construit un dict variante_normalisée -> label canonique
-    """
-    idx = {}
-    for canon, vars in label_map.items():
-        for v in vars:
-            idx[v.lower()] = canon
-    return idx
+VARIANTS = compile_variants_map(LABELS_CA) + compile_variants_map(LABELS_VENTES)
 
-IDX_CA = build_reverse_index(LABELS_CA)
-IDX_V = build_reverse_index(LABELS_VENTES)
-
-def canonical_from_line(ln: str, is_ca: bool) -> str|None:
-    low = ln.lower()
-    idx = IDX_CA if is_ca else IDX_V
-    # essaie exact contient
-    for var, canon in idx.items():
-        if var in low:
-            return canon
-    # essais bonus pour “Cashless 1/2 Aztek”
-    if "cashless" in low and "1" in low and "aztek" in low:
-        return ("CA Cashless1 Aztek" if is_ca else "Vente Cashless1 Aztek")
-    if "cashless" in low and "2" in low and "aztek" in low:
-        return ("CA Cashless2 Aztek" if is_ca else "Vente Cashless2 Aztek")
-    if ("cashless" in low and "1" in low):
-        return ("CA Cashless1" if is_ca else "Vente Cashless1")
-    if ("cashless" in low and "2" in low):
-        return ("CA Cashless2" if is_ca else "Vente Cashless2")
-    if any(w in low for w in ["espèces","especes","cash "]):
-        return ("CA Espece" if is_ca else "Vente Espece")
-    if "total" in low:
-        return ("CA total" if is_ca else "Vente Total")
-    return None
-
-def parse_blocks_adaptive(text: str) -> dict:
+def parse_blocks_stream(text: str) -> dict:
     """
-    Lecture par lignes :
-    - détecte entête colonnes (Cumul/Cumulation | Interim | Interim 2)
-    - pour chaque ligne portant un libellé connu (CA/VENTES), récupère 1 à 3 chiffres dans les lignes proches
-    - si pas d'entête colonnes trouvée, on scanne quand même 2-3 lignes autour
+    Parsing par flux :
+    - On normalise en 'flat' (espaces simples)
+    - Pour chaque variante de libellé, on cherche sa première occurrence et on prend les 3 nombres qui suivent
+    - Si on trouve plusieurs occurrences du même canonique, on garde la première qui a >=1 nombre
     """
     out = {}
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    lines_norm = [norm_spaces_keep_lines(ln) for ln in lines]
+    flat = to_flat(text)
 
-    # header colonnes (optionnel)
-    header_idx, _ = find_col_header_positions(lines_norm)
-
-    def feed_section(is_ca: bool):
-        for i, ln in enumerate(lines_norm):
-            canon = canonical_from_line(ln, is_ca=is_ca)
-            if not canon:
-                continue
-            # point de départ pour chercher chiffres : si header connu, prends à partir de la même ligne, sinon ligne courante
-            start = i if header_idx is None else max(i, header_idx)
-            nums = parse_numbers_from_near(lines_norm, start, max_span=6)
-            a, b, c = (nums + ["", "", ""])[:3]
+    seen = set()
+    for canon, var, pat in VARIANTS:
+        if canon in seen:
+            continue
+        m = pat.search(flat)
+        if not m:
+            continue
+        nums = find_numbers_ahead(flat, m.end(), max_chars=400, max_tokens=3)
+        a, b, c = (nums + ["", "", ""])[:3]
+        if any(x for x in (a, b, c)):
             out[f"{canon}_Cumul"] = a
             out[f"{canon}_Interim"] = b
             out[f"{canon}_Interim2"] = c
-
-    # passe CA puis Ventes
-    feed_section(is_ca=True)
-    feed_section(is_ca=False)
+            seen.add(canon)
     return out
 
 def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
@@ -330,18 +264,17 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
         return row, False
 
     # 2) entête + codes
-    row.update(parse_header(text))
+    row.update(parse_header_section(text))
     row.update(extract_codes_and_key(text))
 
-    # 3) parsing adaptatif
-    parsed = parse_blocks_adaptive(text)
+    # 3) parsing par flux
+    parsed = parse_blocks_stream(text)
     row.update(parsed)
 
-    # 4) score de complétude (N champs CA/Vente numériques)
+    # 4) score de complétude
     def _is_num(s):
         try:
-            float(s)
-            return True
+            float(s); return True
         except:
             return False
 
@@ -351,14 +284,12 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
 
     # 5) debug si KO
     if not ok:
-        dbg_txt = pdf_path.with_suffix(".dbg.txt")
-        dbg_rows = pdf_path.with_suffix(".dbg.rows.jsonl")
         try:
-            dbg_txt.write_text(text, encoding="utf-8", errors="ignore")
-            with dbg_rows.open("w", encoding="utf-8") as f:
-                for ln in text.splitlines():
-                    tokens = [clean_num_tok(x) for x in TOKEN_RE.findall(ln)]
-                    json.dump({"line": ln, "num_tokens": tokens}, f, ensure_ascii=False)
+            pdf_path.with_suffix(".dbg.txt").write_text(text, encoding="utf-8", errors="ignore")
+            with pdf_path.with_suffix(".dbg.tokens.jsonl").open("w", encoding="utf-8") as f:
+                flat = to_flat(text)
+                for m in TOKEN_RE.finditer(flat):
+                    json.dump({"pos": m.start(), "tok": clean_num_tok(m.group())}, f, ensure_ascii=False)
                     f.write("\n")
         except Exception:
             pass
@@ -366,7 +297,6 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
     return row, ok
 
 # ========= SORTIE / UI =========
-
 def print_summary(total, ok, errors, failed_files, out_csv):
     last_update = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     table = Table(title="Résumé de l’analyse", box=HEAVY, show_header=False, expand=True)
@@ -379,7 +309,7 @@ def print_summary(total, ok, errors, failed_files, out_csv):
         tf.add_column("Nom du fichier", style="err")
         for name in failed_files: tf.add_row(name)
         console.print(tf)
-        console.print("[dim]Des fichiers .dbg.txt et .dbg.rows.jsonl ont été générés à côté des PDFs en échec.[/dim]")
+        console.print("[dim]Des fichiers .dbg.txt et .dbg.tokens.jsonl ont été générés à côté des PDFs en échec.[/dim]")
     panel_text = f"[ok][OK][/ok] Export : [hl]{out_csv}[/hl]\n📅 Mis à jour le [hl]{last_update}[/hl]\n[dim]Historique conservé[/dim]"
     console.print(Panel(panel_text, title="Fichier export", border_style="info"))
 
