@@ -295,3 +295,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+import time
+
+if __name__ == "__main__":
+    main()
+    console.print("\n[info]Cette fenêtre se fermera automatiquement dans 10 minutes...[/info]")
+    console.print("[dim]Vous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
+    time.sleep(600)
