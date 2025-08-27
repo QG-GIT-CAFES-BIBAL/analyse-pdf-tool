@@ -15,6 +15,7 @@ import tempfile
 import sys
 from pathlib import Path
 from datetime import datetime
+import time
 
 # ---------- UI (Rich) ----------
 from rich.progress import (
@@ -26,7 +27,6 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.box import HEAVY
 
-# Thème lisible
 console = Console(theme=Theme({
     "ok": "bold green",
     "err": "bold red",
@@ -37,17 +37,15 @@ console = Console(theme=Theme({
 }))
 
 # ========= CONFIG DYNAMIQUE =========
-# Si .exe → toujours Documents/AnalysePDF
 if getattr(sys, 'frozen', False):
     BASE_DIR = Path.home() / "Documents" / "AnalysePDF"
 else:
     BASE_DIR = Path(__file__).resolve().parent
 
-ROOT = BASE_DIR / "Mettre les PDF ICI"        # Dossier d'entrée pour les PDF
-OUT_CSV = BASE_DIR / "export_analyse_pdf.csv" # Fichier de sortie CSV
+ROOT = BASE_DIR / "Mettre les PDF ICI"
+OUT_CSV = BASE_DIR / "export_analyse_pdf.csv"
 RESSOURCES_DIR = BASE_DIR / "dist_bundle_ressources"
 
-# Créer les dossiers si absents
 ROOT.mkdir(parents=True, exist_ok=True)
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -146,26 +144,22 @@ def extract_codes_and_key(text: str) -> dict:
         out["key 1"] = k1
     return out
 
-# Regex séparés
-_NUM_CA = r"([0-9][0-9\s.,]*€?)"   # Pour CA (avec €)
-_NUM_VENTE = r"(\d{1,6})"          # Pour Ventes (entiers simples max 6 chiffres)
+# Regex séparées
+_NUM_CA = r"([0-9][0-9\s.,]*)(?=€)"
+_NUM_VENTES = r"([0-9]{1,10})"
 
-def _clean_num(s: str) -> str:
-    return re.sub(r"\s+", "", s or "").replace("€", "")
-
-def grab_triple_multiline(text: str, prefix: str, label: str, is_vente=False):
-    regex = _NUM_VENTE if is_vente else _NUM_CA
+def grab_triple_multiline(text: str, prefix: str, label: str, is_ca=True):
     m = re.search(rf"{prefix}\s+{label}", text, flags=re.IGNORECASE)
     if m:
         window = text[m.end():m.end()+220]
-        nums = re.findall(regex, window)
-        return tuple(_clean_num(x) for x in (nums[:3] + ["", "", ""])[:3])
+        nums = re.findall(_NUM_CA if is_ca else _NUM_VENTES, window)
+        return tuple(nums[:3] + ["", "", ""])[:3]
     return "","",""
 
-def parse_blocks(text: str, prefix: str, label_map: dict, is_vente=False) -> dict:
+def parse_blocks(text: str, prefix: str, label_map: dict, is_ca=True) -> dict:
     out = {}
     for label_src, col_base in label_map.items():
-        x,y,z = grab_triple_multiline(text, prefix, label_src, is_vente=is_vente)
+        x,y,z = grab_triple_multiline(text, prefix, label_src, is_ca)
         out[f"{col_base}_Cumul"]    = x
         out[f"{col_base}_Interim"]  = y
         out[f"{col_base}_Interim2"] = z
@@ -207,8 +201,8 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
     ca_map = {"Total": "CA total","Espèces": "CA Espece","Cashless 1": "CA Cashless1","Cashless 1 Aztek": "CA Cashless1 Aztek","Cashless 2": "CA Cashless2","Cashless 2 Aztek": "CA Cashless2 Aztek"}
     ventes_map = {"Total": "Vente Total","Espèces": "Vente Espece","Cashless 1": "Vente Cashless1","Cashless 1 Aztek": "Vente Cashless1 Aztek","Cashless 2": "Vente Cashless2","Cashless 2 Aztek": "Vente Cashless2 Aztek"}
 
-    row.update(parse_blocks(text, "CA", ca_map, is_vente=False))
-    row.update(parse_blocks(text, "Ventes", ventes_map, is_vente=True))
+    row.update(parse_blocks(text, "CA", ca_map, is_ca=True))
+    row.update(parse_blocks(text, "Ventes", ventes_map, is_ca=False))
 
     return row, True
 
@@ -261,7 +255,6 @@ def main():
             finally:
                 progress.advance(task)
 
-    # Append ou création
     file_exists = OUT_CSV.exists()
     with open(OUT_CSV, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=HEADERS)
@@ -271,9 +264,9 @@ def main():
     total, errors, ok = len(pdfs), len(failed_files), len(pdfs)-len(failed_files)
     print_summary(total, ok, errors, failed_files, OUT_CSV)
 
-    console.print("\n[info]Cette fenêtre se fermera automatiquement dans 10 minutes...[/info]")
-    console.print("[dim]Vous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
-    import time; time.sleep(600)
+    console.print("\n[dim]Cette fenêtre se fermera automatiquement dans 10 minutes...")
+    console.print("Vous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
+    time.sleep(600)
 
 if __name__ == "__main__":
     main()
