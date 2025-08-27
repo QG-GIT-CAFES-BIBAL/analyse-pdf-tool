@@ -65,7 +65,6 @@ def run_pdftotext(pdf_path: str) -> str:
         with tempfile.TemporaryDirectory() as td:
             out_txt = Path(td) / "out.txt"
             cmd = [PDFTOTEXT, "-layout", "-nopgbrk", pdf_path, str(out_txt)]
-            # 0x08000000 = CREATE_NO_WINDOW (Windows)
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=0x08000000)
             return out_txt.read_text(encoding="utf-8", errors="ignore")
     except Exception:
@@ -122,10 +121,8 @@ def parse_header(text: str) -> dict:
 def extract_codes_and_key(text: str) -> dict:
     flat = re.sub(r"\s+", " ", text)
     out = {}
-    # FR + EN pour les codes gratuits
     for idx, val in re.findall(r"(?:Code\s+gratuit|Free\s+code)\s+(\d+)\s*:\s*([0-9]+(?:\*\*[0-9]/[0-9])?)", flat, flags=re.IGNORECASE):
         out[f"Code gratuit {idx}"] = val
-    # key 1
     k1 = get_first(r"\bkey\s*1\s*:\s*([A-Za-z0-9]+)", flat, flags=re.IGNORECASE)
     if k1:
         out["key 1"] = k1
@@ -135,7 +132,6 @@ def extract_codes_and_key(text: str) -> dict:
 _NUM = r"(-?\d+(?:[.,]\d+)?€?)"
 def _clean_num(s: str) -> str:
     s = (s or "").replace("€", "").strip()
-    # standardise la virgule décimale en point
     return s.replace(",", ".")
 
 def grab_triple_multiline(text: str, prefix: str, label: str):
@@ -146,19 +142,17 @@ def grab_triple_multiline(text: str, prefix: str, label: str):
     """
     if label is None:
         return "", "", ""
-    # Construire les deux formes possibles
     if prefix:
         patt_a = rf"{re.escape(prefix)}\s*[:\-]?\s*{re.escape(label)}"
         patt_b = rf"{re.escape(label)}\s*[:\-]?\s*{re.escape(prefix)}"
         m = re.search(patt_a, text, flags=re.IGNORECASE) or re.search(patt_b, text, flags=re.IGNORECASE)
     else:
-        # Pas de prefix imposé : on matche juste le label
         m = re.search(rf"{re.escape(label)}", text, flags=re.IGNORECASE)
 
     if not m:
         return "", "", ""
 
-    window = text[m.end(): m.end() + 400]  # fenêtre large pour capter "Interim 2"
+    window = text[m.end(): m.end() + 400]
     nums = re.findall(_NUM, window)
     vals = [_clean_num(x) for x in nums]
     a, b, c = (vals + ["", "", ""])[:3]
@@ -208,7 +202,7 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
         "Espèces": "CA Espece",
         "Cash": "CA Espece",
         "Cashless 1": "CA Cashless1",
-        "Cashless turnover 1": "CA Cashless1",  # tolérance
+        "Cashless turnover 1": "CA Cashless1",
         "Cashless 1 Aztek": "CA Cashless1 Aztek",
         "Aztek cashless turnover 1": "CA Cashless1 Aztek",
         "Cashless 2": "CA Cashless2",
@@ -256,7 +250,7 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
     row.update(parse_blocks(text, "", ca_en_map))
     row.update(parse_blocks(text, "", ventes_en_map))
 
-    # -------- Garde-fous simples pour éviter d'écrire des données pourries --------
+    # -------- Garde-fous élargis (moins stricts) --------
     def _is_num(s):
         try:
             float(s)
@@ -264,9 +258,8 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
         except:
             return False
 
-    clés_essentielles = ["CA total_Cumul", "Vente Total_Cumul"]
-    if not any(_is_num(row.get(k, "")) for k in clés_essentielles):
-        # extraction probablement ratée
+    # Au moins UNE valeur numérique trouvée dans TOUTES les colonnes CA/Vente
+    if not any(_is_num(v) for k, v in row.items() if k.startswith(("CA", "Vente"))):
         return row, False
 
     return row, True
