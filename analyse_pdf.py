@@ -205,6 +205,10 @@ def main():
         if not file_exists: writer.writeheader(); writer.writerows(results)
     total, errors, ok = len(pdfs), len(failed_files), len(pdfs)-len(failed_files)
     print_summary(total,ok,errors,failed_files,OUT_CSV)
-    console.print("\n[info]Cette fenêtre se fermera dans 10 minutes...[/info]"); time.sleep(600)
+    console.print("\n[bold green]Merci d'avoir utilisé l'outil d'analyse PDF ![/bold green]")
+console.print("[cyan]Cette fenêtre se fermera automatiquement dans 10 minutes.[/cyan]")
+console.print("[dim]Vous pouvez également la fermer manuellement en cliquant sur la croix.[/dim]\n")
+time.sleep(600)
+
 
 if __name__=="__main__": main()
