@@ -5,7 +5,6 @@ Analyse des PDFs (Touch N Pay) -> CSV
 - Barre de progression colorée (Rich)
 - Résumé final "pro": tableau coloré + panel du fichier export
 - Historique conservé dans export_analyse_pdf.csv (append au lieu d'écraser)
-- Détection avancée d'erreurs -> colonne "status" (OK / ERREUR)
 """
 
 import os
@@ -27,6 +26,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.box import HEAVY
 
+# Thème lisible
 console = Console(theme=Theme({
     "ok": "bold green",
     "err": "bold red",
@@ -36,26 +36,31 @@ console = Console(theme=Theme({
     "dim": "dim",
 }))
 
-# ========= CONFIG =========
+# ========= CONFIG DYNAMIQUE =========
+# Si .exe → toujours Documents/AnalysePDF
 if getattr(sys, 'frozen', False):
     BASE_DIR = Path.home() / "Documents" / "AnalysePDF"
 else:
     BASE_DIR = Path(__file__).resolve().parent
 
-ROOT = BASE_DIR / "Mettre les PDF ICI"
-OUT_CSV = BASE_DIR / "export_analyse_pdf.csv"
+ROOT = BASE_DIR / "Mettre les PDF ICI"        # Dossier d'entrée pour les PDF
+OUT_CSV = BASE_DIR / "export_analyse_pdf.csv" # Fichier de sortie CSV
 RESSOURCES_DIR = BASE_DIR / "dist_bundle_ressources"
 
+# Créer les dossiers si absents
 ROOT.mkdir(parents=True, exist_ok=True)
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Poppler
 POPPLER_BIN = RESSOURCES_DIR / "poppler-bin"
 PDFTOTEXT   = str(POPPLER_BIN / "pdftotext.exe")
 PDFTOPPM    = str(POPPLER_BIN / "pdftoppm.exe")
 
+# Tesseract
 TESSERACT_EXE = str(RESSOURCES_DIR / "tesseract" / "tesseract.exe")
 TESSDATA_DIR  = str(RESSOURCES_DIR / "tesseract" / "tessdata")
 TESS_LANG     = "fra+eng"
+
 ENABLE_OCR_FALLBACK = True
 
 # ========= HELPERS =========
@@ -162,33 +167,6 @@ def parse_blocks(text: str, prefix: str, label_map: dict) -> dict:
         out[f"{col_base}_Interim2"] = z
     return out
 
-# ========= VALIDATION =========
-def is_value_incoherent(val: str) -> bool:
-    if not val:
-        return False
-    num = val.replace(" ", "").replace(",", ".")
-    if len(num) > 8:  # trop long -> erreur
-        return True
-    try:
-        f = float(num)
-        if f < 0 or f > 10_000_000:
-            return True
-    except ValueError:
-        return True
-    return False
-
-def validate_row(row: dict) -> bool:
-    if not row.get("id") and not row.get("date"):
-        return False
-    sales_cols = [k for k in row.keys() if "CA" in k or "Vente" in k]
-    if all(not row.get(k) for k in sales_cols):
-        return False
-    for k in sales_cols:
-        if is_value_incoherent(row.get(k, "")):
-            return False
-    return True
-
-# ========= HEADERS =========
 HEADERS = [
     "id", "date", "Numéro de relevé",
     "CA total_Cumul","CA total_Interim","CA total_Interim2",
@@ -204,7 +182,7 @@ HEADERS = [
     "Vente Cashless2_Cumul","Vente Cashless2_Interim","Vente Cashless2_Interim2",
     "Vente Cashless2 Aztek_Cumul","Vente Cashless2 Aztek_Interim","Vente Cashless2 Aztek_Interim2",
     "Code gratuit 1","Code gratuit 2","Code gratuit 3","Code gratuit 4","Code gratuit 5","Code gratuit 6","Code gratuit 7",
-    "key 1","status"
+    "key 1",
 ]
 
 # ========= PIPELINE =========
@@ -215,8 +193,6 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
     text = norm_spaces_keep_lines(raw_text)
 
     row = {k: "" for k in HEADERS}
-    row["status"] = "ERREUR"
-
     if not text.strip():
         row["id"] = pdf_path.stem
         return row, False
@@ -230,10 +206,7 @@ def process_pdf(pdf_path: Path) -> tuple[dict, bool]:
     row.update(parse_blocks(text, "CA", ca_map))
     row.update(parse_blocks(text, "Ventes", ventes_map))
 
-    ok_flag = validate_row(row)
-    row["status"] = "OK" if ok_flag else "ERREUR"
-
-    return row, ok_flag
+    return row, True
 
 def print_summary(total, ok, errors, failed_files, out_csv):
     last_update = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -279,11 +252,12 @@ def main():
                 results.append(row)
                 if not ok: failed_files.append(pdf.name)
             except Exception:
-                r = {k: "" for k in HEADERS}; r["id"] = pdf.stem; r["status"] = "ERREUR"
+                r = {k: "" for k in HEADERS}; r["id"] = pdf.stem
                 results.append(r); failed_files.append(pdf.name)
             finally:
                 progress.advance(task)
 
+    # Append ou création
     file_exists = OUT_CSV.exists()
     with open(OUT_CSV, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=HEADERS)
@@ -292,6 +266,10 @@ def main():
 
     total, errors, ok = len(pdfs), len(failed_files), len(pdfs)-len(failed_files)
     print_summary(total, ok, errors, failed_files, OUT_CSV)
+
+    console.print("\n[dim]Cette fenêtre se fermera automatiquement dans 10 minutes...")
+    console.print("Vous pouvez aussi la fermer directement en cliquant sur la croix.[/dim]\n")
+    import time; time.sleep(600)
 
 if __name__ == "__main__":
     main()
